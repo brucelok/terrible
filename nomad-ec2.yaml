@@ -1,0 +1,142 @@
+---
+- name: Provision EC2 and set up Nomad server
+  hosts: localhost
+  connection: local
+  vars:
+    aws_region: ap-southeast-2
+    instance_type: t3.small
+    ami_id: ami-0f5d1713c9af4fe30
+    key_name: myMacbook
+    subnet_id: subnet-0f72be4624adad8ff
+    security_group_name: nomad-sg
+    nomad_version: 1.9.7
+    nomad_zip_url: "https://releases.hashicorp.com/nomad/{{ nomad_version }}/nomad_{{ nomad_version }}_linux_amd64.zip"
+
+  tasks:
+    - name: Create secgroup for Nomad
+      amazon.aws.ec2_group:
+        name: "{{ security_group_name }}"
+        description: secgroup for Nomad
+        region: "{{ aws_region }}"
+        rules:
+          - proto: tcp
+            from_port: 22
+            to_port: 22
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            from_port: 4646
+            to_port: 4646
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            from_port: 4647
+            to_port: 4647
+            cidr_ip: 0.0.0.0/0
+      register: sg
+
+    - name: create EC2 
+      amazon.aws.ec2_instance:
+        name: nomad-server
+        key_name: "{{ key_name }}"
+        instance_type: "{{ instance_type }}"
+        image_id: "{{ ami_id }}"
+        region: "{{ aws_region }}"
+        wait: yes
+        count: 1
+        vpc_subnet_id: "{{ subnet_id }}"
+        network_interfaces:
+          - assign_public_ip: true
+        security_group: "{{ security_group_name }}"
+        tags:
+          Name: Nomad-Server
+      register: ec2
+
+    - name: Wait for SSH to come up
+      wait_for:
+        host: "{{ ec2.instances[0].public_ip_address }}"
+        port: 22
+        delay: 10
+        timeout: 300
+
+    - name: Add EC2 instance to dynamic inventory
+      add_host:
+        name: "{{ ec2.instances[0].public_ip_address }}"
+        groups: nomad_servers
+        ansible_user: ubuntu
+        nomad_zip_url: "{{ nomad_zip_url }}"
+
+- name: Install and configure Nomad on EC2 instance
+  hosts: nomad_servers
+  become: yes
+  tasks:
+    - name: Install unzip
+      apt:
+        name: unzip
+        state: present
+        update_cache: yes
+
+    - name: Download Nomad binary
+      get_url:
+        url: "{{ nomad_zip_url }}"
+        dest: /tmp/nomad.zip
+        mode: '0644'
+
+    - name: Unzip Nomad binary
+      unarchive:
+        src: /tmp/nomad.zip
+        dest: /usr/local/bin/
+        remote_src: yes
+
+    - name: Ensure executable
+      file:
+        path: /usr/local/bin/nomad
+        mode: '0755'
+
+    - name: Create Nomad data dir
+      file:
+        path: /opt/nomad/data
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Create Nomad config dir
+      file:
+        path: /etc/nomad.d
+        state: directory
+        mode: '0755'
+
+    - name: copy Nomad config file
+      template:
+        src: nomad.hcl.j2
+        dest: /etc/nomad.d/nomad.hcl
+        mode: '0644'
+
+    - name: Create Nomad systemd service file
+      copy:
+        dest: /etc/systemd/system/nomad.service
+        content: |
+          [Unit]
+          Description=Nomad
+          Documentation=https://www.nomadproject.io/docs/
+          Wants=network-online.target
+          After=network-online.target
+
+          [Service]
+          ExecStart=/usr/local/bin/nomad agent -config=/etc/nomad.d/nomad.hcl
+          ExecReload=/bin/kill -HUP $MAINPID
+          Restart=always
+          RestartSec=10
+
+          [Install]
+          WantedBy=multi-user.target
+        mode: '0644'
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable and start Nomad service
+      systemd:
+        name: nomad
+        enabled: yes
+        state: started
